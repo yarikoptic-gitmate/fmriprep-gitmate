@@ -754,6 +754,14 @@ https://fmriprep.readthedocs.io/en/{currentv.base_version if is_release else 'la
         help="Enable Nipype's resource monitoring to keep track of memory and CPU usage",
     )
     g_other.add_argument(
+        '--write-provenance',
+        action='store_true',
+        default=False,
+        help='Record the provenance (W3C PROV) of all the processing steps executed by Nipype, '
+        'and write it as JSON-LD (provenance.jsonld) into the log directory of each '
+        'participant (and session, when processing sessions separately).',
+    )
+    g_other.add_argument(
         '--config-file',
         action='store',
         metavar='FILE',

@@ -58,6 +58,7 @@ omp_nthreads = 8
 plugin = "MultiProc"
 resource_monitor = false
 stop_on_first_crash = false
+write_provenance = false
 
 [nipype.plugin_args]
 maxtasksperchild = 1

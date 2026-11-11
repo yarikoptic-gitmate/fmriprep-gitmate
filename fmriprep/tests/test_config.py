@@ -119,3 +119,23 @@ def test_prng_seed(master_seed, ants_seed, numpy_seed):
     _reset_config()
     for seed in ('_random_seed', 'master', 'ants', 'numpy'):
         assert getattr(config.seeds, seed) is None
+
+
+def test_write_provenance(monkeypatch):
+    """Check that Nipype's provenance tracking is enabled on demand."""
+    from nipype import config as ncfg
+
+    monkeypatch.setitem(ncfg._sections['execution'], 'write_provenance', 'false')
+    hash_method = ncfg.get('execution', 'hash_method')
+
+    config.nipype.init()
+    assert ncfg.get('execution', 'write_provenance') == 'false'
+
+    config.nipype.load({'write_provenance': True}, init=True)
+    assert config.nipype.write_provenance is True
+    assert ncfg.get('execution', 'write_provenance') == 'true'
+    # Caching of nodes must not be affected
+    assert ncfg.get('execution', 'hash_method') == hash_method
+
+    _reset_config()
+    assert config.nipype.write_provenance is False
