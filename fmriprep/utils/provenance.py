@@ -33,9 +33,21 @@ for the description of each interface, split the description by participant
 
 .. note::
     *Nipype*'s own ``write_provenance`` execution option is deliberately **not** used:
-    it has no effect on the worker processes *fMRIPrep* starts, it writes unrequested
-    files into the current and working directories, and a failure to write them would
-    make a successful run of *fMRIPrep* fail.
+
+    * for every interface run in the main process it writes ``provenance.provn`` and
+      ``provenance.ttl`` files into the working directory of the node, while it has
+      no effect on the worker processes *fMRIPrep* starts;
+    * at the end of the run it writes ``workflow_provenance_<date>.provn`` and ``.trig``
+      into the base of the working directory (i.e., not with the derivatives),
+      for all participants together, with random identifiers, and the names of the user
+      and of the host; and
+    * a failure to write them (e.g., when the user is unknown to the system, as is common
+      in containers) makes a successful run of *fMRIPrep* fail.
+
+    Two limitations of how *Nipype* encodes values remain, and result in warnings:
+    dictionaries and lists holding objects such as :class:`pathlib.Path` are replaced by an
+    error message, and nodes with sequences of *NumPy* scalars among their inputs or
+    outputs are left without their detailed record.
 
 **Identifiers**.
 The run, and the workflows and nodes executed in it, are given identifiers
@@ -74,9 +86,18 @@ import logging
 import os
 import re
 import shlex
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
+from copy import copy
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote
+
+import prov.model as pm
+from nipype.interfaces.base import isdefined
+from nipype.interfaces.base.support import InterfaceResult
+from nipype.utils import provenance as nprov
+from nipype.utils.provenance import ProvStore, dcterms, foaf, nipype_ns, prov_encode
 
 LOGGER = logging.getLogger('nipype.workflow')
 
@@ -162,7 +183,6 @@ def get_run_start(run_uuid):
     True
 
     """
-    from datetime import UTC, datetime
 
     if match := _RUN_UUID.match(str(run_uuid)):
         try:
@@ -220,7 +240,6 @@ def _known_user():
     within containers (``docker run -u $(id -u)``).
     The name of the user is not recorded in any case.
     """
-    from unittest import mock
 
     try:
         getpass.getuser()
@@ -242,10 +261,6 @@ def _nipype_patches():
 
     Should *Nipype* rename what is patched here, records are just built without these.
     """
-    from contextlib import ExitStack
-    from unittest import mock
-
-    from nipype.utils import provenance as nprov
 
     hash_infile = getattr(nprov, 'hash_infile', None)
     cache = {}
@@ -271,12 +286,19 @@ def _nipype_patches():
 
 
 def _results(node):
-    """Split the result of a node into the results of the interfaces it has run."""
-    from nipype.interfaces.base import isdefined
-    from nipype.interfaces.base.support import InterfaceResult
+    """Split the result of a node into the results of the interfaces it has run.
+
+    Data sinks are given metadata when they are created, which they do not hold
+    as inputs: they are described along with their inputs.
+    """
 
     result = node.result
+    metadata = getattr(node.interface, '_metadata', None)
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
     if not isinstance(result.runtime, list):
+        if metadata:
+            result = copy(result)
+            result.inputs = {**metadata, **(result.inputs or {})}
         return {'': result}
 
     # MapNode: one result per iteration
@@ -286,7 +308,7 @@ def _results(node):
             result.interface[idx], runtime, outputs={}
         )
         if result.inputs and idx < len(result.inputs):
-            subresult.inputs = result.inputs[idx]
+            subresult.inputs = {**metadata, **result.inputs[idx]}
         for key, values in result.outputs.items() if result.outputs else ():
             if isdefined(values) and idx < len(values):
                 subresult.outputs[key] = values[idx]
@@ -300,8 +322,6 @@ def _add_record(doc, records, node_id, suffix=''):
     to what would otherwise have random ones, and leaving private information out.
 
     """
-    import prov.model as pm
-    from nipype.utils.provenance import dcterms, foaf, nipype_ns
 
     def _qname(name):
         return doc.valid_qualified_name(f'bidsprov:{node_id}/{name}{suffix}')
@@ -386,8 +406,6 @@ def _add_members(bundle, record, _value):
 
     *Nipype* records lists of several files as text, hence without their checksums.
     """
-    import prov.model as pm
-    from nipype.utils.provenance import prov_encode
 
     files = [
         afile
@@ -442,10 +460,6 @@ def build_provenance(execgraph, run_uuid, *, version=None, command=None, ended=N
         The provenance document.
 
     """
-    from datetime import UTC, datetime
-
-    import prov.model as pm
-    from nipype.utils.provenance import ProvStore, dcterms, nipype_ns
 
     doc = ProvStore().g  # Comes with the namespaces Nipype's records use
     doc.add_namespace('bidsprov', PROV_NAMESPACE)
@@ -589,7 +603,6 @@ def write_provenance(execgraph, default_dir, run_uuid, *, version=None, command=
         The exceptions raised for the log directories whose file could not be written.
 
     """
-    from datetime import UTC, datetime
 
     ended = datetime.now(UTC)
     out_files = []

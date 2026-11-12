@@ -22,16 +22,30 @@
 #
 """Tests of provenance records."""
 
+import getpass
+import importlib.util
 import json
+import os
+import pwd
+import shutil
 import socket
+from pathlib import Path
 
+import nibabel as nb
+import nitransforms as nt
+import numpy as np
 import pytest
 import rdflib
+from nipype import config as ncfg
 from nipype.interfaces import utility as niu
 from nipype.interfaces.base import CommandLine
 from nipype.pipeline import engine as pe
+from nipype.pipeline.engine import Node
+from nipype.utils import provenance as nprov
 from rdflib.compare import isomorphic
 
+from fmriprep.interfaces import DerivativesDataSink
+from fmriprep.interfaces.resampling import ResampleSeries
 from fmriprep.utils.provenance import (
     PROV_NAMESPACE,
     get_run_id,
@@ -103,7 +117,6 @@ def _init_wf(base_dir, log_dir, subjects):
 @pytest.fixture(scope='module')
 def workflow_run(tmp_path_factory):
     """Run the workflow once: tests only read its results."""
-    from nipype import config as ncfg
 
     tmp_path = tmp_path_factory.mktemp('provenance')
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -332,7 +345,6 @@ def test_jsonld_default_graph(tmp_path, execgraph):
 
 def test_privacy(tmp_path, execgraph, monkeypatch):
     """User, host and output streams are not recorded."""
-    import getpass
 
     monkeypatch.setenv('LOGNAME', 'jane.doe')
     assert getpass.getuser() == 'jane.doe'
@@ -378,9 +390,6 @@ def test_reproducibility_envvars(tmp_path, execgraph):
 
 def test_unknown_user(tmp_path, execgraph, monkeypatch):
     """Users without a name (e.g., ``docker run -u <uid>``) get their provenance too."""
-    import getpass
-    import os
-    import pwd
 
     for envvar in ('LOGNAME', 'USER', 'LNAME', 'USERNAME'):
         monkeypatch.delenv(envvar, raising=False)
@@ -398,7 +407,6 @@ def test_unknown_user(tmp_path, execgraph, monkeypatch):
 
 def test_checksums_once(tmp_path, execgraph, monkeypatch):
     """Files are read once, however many nodes they are involved in."""
-    from nipype.utils import provenance as nprov
 
     calls = []
     hash_infile = nprov.hash_infile
@@ -435,7 +443,6 @@ def test_write_provenance_errors(tmp_path, execgraph):
 
 def test_node_without_result(tmp_path, execgraph, monkeypatch, caplog):
     """A node that cannot be described does not affect the others."""
-    from nipype.pipeline.engine import Node
 
     def _result(self):
         if self.fullname == 'fmriprep_wf.sub_01_wf.first':
@@ -457,25 +464,19 @@ def test_node_without_result(tmp_path, execgraph, monkeypatch, caplog):
     assert len(list(default.subjects(RDF_TYPE, PROV.Bundle))) == 5
 
 
-def test_redo_resampling(tmp_path_factory, monkeypatch, capsys):
-    """Resamplings can be redone with nipost alone, from their provenance records."""
-    import importlib.util
-    from pathlib import Path
-
-    import nibabel as nb
-    import nitransforms as nt
-    import numpy as np
-
-    from fmriprep.interfaces.resampling import ResampleSeries
-
+@pytest.fixture(scope='module')
+def prov2nipost():
     script = Path(__file__).parents[3] / 'scripts' / 'prov2nipost.py'
     if not script.exists():
         pytest.skip('scripts/prov2nipost.py is only available in the source tree')
     spec = importlib.util.spec_from_file_location('prov2nipost', script)
-    prov2nipost = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(prov2nipost)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    from nipype import config as ncfg
+
+def test_redo_resampling(tmp_path_factory, monkeypatch, capsys, prov2nipost):
+    """Resamplings can be redone with nipost alone, from their provenance records."""
 
     tmp_path = tmp_path_factory.mktemp('redo')
     monkeypatch.chdir(tmp_path)
@@ -535,3 +536,87 @@ def test_redo_resampling(tmp_path_factory, monkeypatch, capsys):
     (tmp_path / 'moved' / 'xfm1.txt').write_text((tmp_path / 'moved' / 'xfm0.txt').read_text())
     assert prov2nipost.main([*args, '--map', f'{tmp_path}={tmp_path}/moved']) == 1
     assert 'differs from what was recorded' in capsys.readouterr().out
+
+
+def test_redo_target(tmp_path_factory, monkeypatch, capsys, prov2nipost):
+    """A derivative and its sidecar can be regenerated once the working directory is gone."""
+
+    tmp_path = tmp_path_factory.mktemp('target')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'logs'))
+    bold = tmp_path / 'raw' / 'sub-01' / 'func' / 'sub-01_task-rest_bold.nii.gz'
+    bold.parent.mkdir(parents=True)
+    rng = np.random.default_rng(2026)
+    nb.Nifti1Image(rng.random((8, 8, 8, 3), dtype='f4'), np.eye(4)).to_filename(bold)
+    nb.Nifti1Image(np.zeros((6, 6, 6), dtype='f4'), np.eye(4)).to_filename('ref.nii.gz')
+    matrix = np.eye(4)
+    matrix[0, 3] = 0.5
+    nt.linear.Affine(matrix).to_filename('xfm.txt', fmt='itk')
+
+    wf = pe.Workflow(name='fmriprep_wf', base_dir=str(tmp_path / 'work'))
+    inputnode = pe.Node(niu.IdentityInterface(fields=['metadata']), name='inputnode')
+    inputnode.inputs.metadata = {'RepetitionTime': 2.0}
+    resample = pe.Node(
+        ResampleSeries(
+            in_file=str(bold),
+            ref_file=str(tmp_path / 'ref.nii.gz'),
+            transforms=[str(tmp_path / 'xfm.txt')],
+        ),
+        name='resample',
+    )
+    ds_bold = pe.Node(
+        DerivativesDataSink(
+            base_directory=str(tmp_path / 'out'),
+            source_file=str(bold),
+            space='MNI152NLin6Asym',
+            desc='preproc',
+            compress=True,
+            TaskName='rest',
+        ),
+        name='ds_bold',
+    )
+    wf.connect([
+        (resample, ds_bold, [('out_file', 'in_file')]),
+        (inputnode, ds_bold, [('metadata', 'meta_dict')]),
+    ])  # fmt:skip
+    execgraph = wf.run(plugin='Linear')
+    (out_file,), errors = write_provenance(execgraph, tmp_path / 'logs', RUN_UUID)
+    assert errors == {}
+
+    name = 'sub-01/func/sub-01_task-rest_space-MNI152NLin6Asym_desc-preproc_bold'
+    original = tmp_path / 'out' / f'{name}.nii.gz'
+    sidecar = json.loads(original.with_name(original.name[:-7] + '.json').read_text())
+    assert sidecar['TaskName'] == 'rest'
+
+    # Metadata given to the data sink when created are recorded as its inputs
+    graph = _load(out_file).graph(_id('/fmriprep_wf.ds_bold/record'))
+    assert {str(port) for port in graph.objects(None, NIPYPE.inPort)} >= {'TaskName', 'meta_dict'}
+
+    # The intermediate file is gone with the working directory
+    shutil.rmtree(tmp_path / 'work')
+    args = [str(out_file), '--target', 'desc-preproc_bold.nii.gz', '--out-dir', 'redo']
+    assert prov2nipost.main([*args, '--dry-run']) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert {line.split(' ', 1)[1] for line in lines if line.startswith('INPUT ')} == {
+        str(bold),
+        str(tmp_path / 'ref.nii.gz'),
+        str(tmp_path / 'xfm.txt'),
+    }
+    assert {line.split(' ', 1)[1] for line in lines if line.startswith('OUTPUT ')} == {
+        str(tmp_path / 'redo' / f'{name}.nii.gz'),
+        str(tmp_path / 'redo' / f'{name}.json'),
+    }
+    assert not (tmp_path / 'redo').exists()
+
+    assert prov2nipost.main(args) == 0
+    regenerated = tmp_path / 'redo' / f'{name}.nii.gz'
+    assert regenerated.read_bytes() == original.read_bytes()
+    assert (
+        json.loads(regenerated.with_name(regenerated.name[:-7] + '.json').read_text()) == sidecar
+    )
+
+    # Nothing can be done about what was not recorded, or without what is needed
+    assert prov2nipost.main([str(out_file), '--target', 'nonexistent.nii.gz']) == 1
+    bold.unlink()
+    assert prov2nipost.main(args) == 1
+    assert 'PROBLEM' in capsys.readouterr().out
