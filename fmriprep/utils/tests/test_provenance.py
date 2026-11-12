@@ -55,6 +55,10 @@ def _id(local=''):
     return rdflib.URIRef(f'{PROV_NAMESPACE}{RUN_ID}{local}')
 
 
+def _describe(files):
+    return ', '.join(sorted(files))
+
+
 def _add(a, b):
     from pathlib import Path
 
@@ -81,8 +85,11 @@ def _init_wf(base_dir, log_dir, subjects):
         )
         second.inputs.a = [3, 4]
         echo = pe.Node(CommandLine('echo', args=MARKER), name='echo')
+        # A dictionary of files, which Nipype records as text
+        describe = pe.Node(niu.Function(function=_describe), name='describe')
+        describe.inputs.files = {'self': __file__}
         sub_wf.connect(first, 'out', second, 'b')
-        sub_wf.add_nodes([echo])
+        sub_wf.add_nodes([echo, describe])
         # Mimic fmriprep.workflows.base.init_fmriprep_wf
         sub_wf.config['execution']['crashdump_dir'] = str(log_dir / f'sub-{subject}' / 'log')
         for node in sub_wf._get_all_nodes():
@@ -91,17 +98,36 @@ def _init_wf(base_dir, log_dir, subjects):
     return wf
 
 
-@pytest.fixture
-def execgraph(tmp_path, monkeypatch):
+@pytest.fixture(scope='module')
+def workflow_run(tmp_path_factory):
+    """Run the workflow once: tests only read its results."""
     from nipype import config as ncfg
 
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setitem(
-        ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'out' / 'logs')
-    )
-    wf = _init_wf(tmp_path / 'work', tmp_path / 'out', ['01', '02'])
-    # Processes started afresh, as fMRIPrep does, do not inherit Nipype's configuration
-    return wf.run(plugin='MultiProc', plugin_args={'n_procs': 2, 'mp_context': 'forkserver'})
+    tmp_path = tmp_path_factory.mktemp('provenance')
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setitem(
+            ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'out' / 'logs')
+        )
+        wf = _init_wf(tmp_path / 'work', tmp_path / 'out', ['01', '02'])
+        # Processes started afresh, as fMRIPrep does, do not inherit Nipype's configuration
+        execgraph = wf.run(
+            plugin='MultiProc', plugin_args={'n_procs': 2, 'mp_context': 'forkserver'}
+        )
+    return execgraph, tmp_path
+
+
+@pytest.fixture
+def execgraph(workflow_run):
+    return workflow_run[0]
+
+
+@pytest.fixture
+def tmp_path(workflow_run):
+    """Where the workflow was run; provenance files are removed after each test."""
+    yield workflow_run[1]
+    for path in (workflow_run[1] / 'out').rglob('*provenance*'):
+        path.unlink()
 
 
 def _write(execgraph, tmp_path):
@@ -149,6 +175,7 @@ def test_group_nodes(tmp_path, execgraph):
         subject = path.parent.name.removeprefix('sub-')
         assert sorted(node.fullname for node in nodes) == [
             'fmriprep_wf.shared',
+            f'fmriprep_wf.sub_{subject}_wf.describe',
             f'fmriprep_wf.sub_{subject}_wf.echo',
             f'fmriprep_wf.sub_{subject}_wf.first',
             f'fmriprep_wf.sub_{subject}_wf.second',
@@ -165,6 +192,7 @@ def test_write_provenance(tmp_path, execgraph):
     ]
     # Nothing else is left behind
     assert sorted(path.name for path in tmp_path.iterdir()) == ['out', 'work']
+    assert not list(tmp_path.rglob('.*.tmp'))
     assert [path.name for path in (tmp_path / 'work').iterdir()] == ['fmriprep_wf']
     assert [path.name for path in out_files[0].parent.iterdir()] == ['provenance.jsonld']
 
@@ -180,6 +208,7 @@ def test_write_provenance(tmp_path, execgraph):
         sub_wf = f'/fmriprep_wf.sub_{subject}_wf'
         nodes = {
             _id('/fmriprep_wf.shared'): _id('/fmriprep_wf'),
+            _id(f'{sub_wf}.describe'): _id(sub_wf),
             _id(f'{sub_wf}.echo'): _id(sub_wf),
             _id(f'{sub_wf}.first'): _id(sub_wf),
             _id(f'{sub_wf}.second'): _id(sub_wf),
@@ -224,6 +253,7 @@ def test_write_provenance(tmp_path, execgraph):
         # One bundle per execution of an interface
         records = {
             _id('/fmriprep_wf.shared/record'): _id('/fmriprep_wf.shared'),
+            _id(f'{sub_wf}.describe/record'): _id(f'{sub_wf}.describe'),
             _id(f'{sub_wf}.echo/record'): _id(f'{sub_wf}.echo'),
             _id(f'{sub_wf}.first/record'): _id(f'{sub_wf}.first'),
             _id(f'{sub_wf}.second/record-0'): _id(f'{sub_wf}.second'),
@@ -256,8 +286,8 @@ def test_write_provenance(tmp_path, execgraph):
 
         # The details of what was run do not leak across participants
         workdirs = _values(dataset, NIPYPE.workingDirectory)
-        assert len(workdirs) == 5
-        assert sum(f'sub_{subject}_wf' in workdir for workdir in workdirs) == 4
+        assert len(workdirs) == 6
+        assert sum(f'sub_{subject}_wf' in workdir for workdir in workdirs) == 5
         assert not any(f'sub_{other}_wf' in workdir for workdir in workdirs)
         # Checksums of the files that still exist: 3 + 3, and 3 + 4
         # (Nipype removes the outputs that no other node needs)
@@ -285,7 +315,7 @@ def test_jsonld_default_graph(tmp_path, execgraph):
     assert set(jsonld) == {'@context', '@graph'}
     assert all('@id' in item for item in jsonld['@graph'])
     named = [item for item in jsonld['@graph'] if '@graph' in item]
-    assert len(named) == 5
+    assert len(named) == 6
     assert all(item['@id'].startswith(f'bidsprov:{RUN_ID}/') for item in named)
 
 
@@ -302,6 +332,7 @@ def test_privacy(tmp_path, execgraph, monkeypatch):
         assert 'foaf:host' not in text
         assert f'file://{socket.gethostname()}' not in text
         assert 'file:///' in text
+        assert f'file://{__file__}' in text  # within a dictionary
         for stream in ('stdout', 'stderr', 'merged', 'LoggedInUser', 'prov:Person'):
             assert stream not in text
         # What the command printed is not recorded: the marker only shows as an input
@@ -355,16 +386,44 @@ def test_checksums_once(tmp_path, execgraph, monkeypatch):
     assert nprov.hash_infile is _hash_infile
 
 
-def test_write_provenance_errors(tmp_path, execgraph, monkeypatch):
+def test_write_provenance_errors(tmp_path, execgraph):
     """A participant whose records cannot be written does not affect the others."""
-    from pathlib import Path
+    log_dir = tmp_path / 'out' / 'sub-01' / 'log'
+    log_dir.parent.mkdir(parents=True, exist_ok=True)
+    if log_dir.exists():
+        log_dir.rmdir()  # Emptied after earlier tests
+    log_dir.write_text('not a directory')
+    try:
+        out_files, errors = write_provenance(execgraph, tmp_path / 'out' / 'logs', RUN_UUID)
+    finally:
+        log_dir.unlink()
 
-    bad_node = next(n for n in execgraph.nodes() if n.fullname == 'fmriprep_wf.sub_01_wf.first')
-    for path in Path(bad_node.output_dir()).glob('result_*.pklz'):
-        path.unlink()
-
-    out_files, errors = write_provenance(execgraph, tmp_path / 'out' / 'logs', RUN_UUID)
     assert out_files == [tmp_path / 'out' / 'sub-02' / 'log' / 'provenance.jsonld']
-    assert list(errors) == [tmp_path / 'out' / 'sub-01' / 'log']
+    assert list(errors) == [log_dir]
+    assert isinstance(errors[log_dir], OSError)
     # No partial file is left behind
     assert list((tmp_path / 'out').rglob('*provenance*')) == out_files
+
+
+def test_node_without_result(tmp_path, execgraph, monkeypatch, caplog):
+    """A node that cannot be described does not affect the others."""
+    from nipype.pipeline.engine import Node
+
+    def _result(self):
+        if self.fullname == 'fmriprep_wf.sub_01_wf.first':
+            raise FileNotFoundError('no result file')
+        return self._load_results()
+
+    monkeypatch.setattr(Node, 'result', property(_result))
+    out_files = _write(execgraph, tmp_path)
+    assert len(out_files) == 2
+    assert 'No provenance record for node "fmriprep_wf.sub_01_wf.first"' in caplog.text
+
+    dataset = _load(tmp_path / 'out' / 'sub-01' / 'log' / 'provenance.jsonld')
+    default = dataset.default_graph
+    node = _id('/fmriprep_wf.sub_01_wf.first')
+    assert (node, RDF_TYPE, PROV.Activity) in default
+    assert (node, DCTERMS.isPartOf, _id('/fmriprep_wf.sub_01_wf')) in default
+    assert (_id('/fmriprep_wf.sub_01_wf.second'), PROV.wasInformedBy, node) in default
+    assert not list(default.subjects(PROV.wasGeneratedBy, node))
+    assert len(list(default.subjects(RDF_TYPE, PROV.Bundle))) == 5

@@ -113,7 +113,8 @@ workflows and nodes, so they are both unique and informative:
   of its UUID (for instance, ``fmriprep-20200306T105302-d365772b``);
 * ``bids::prov#<run-id>/<workflow>`` for each workflow
   (for instance, ``.../fmriprep_26_0_wf.sub_01_wf.anat_fit_wf``); and
-* ``bids::prov#<run-id>/<workflow>.<node>`` for each node.
+* ``bids::prov#<run-id>/<workflow>.<node>`` for each node (followed by the identifier
+  *Nipype* gives to each expansion, for nodes with iterables).
 
 Workflows and nodes are related to the workflow (or run) they belong to with
 ``dcterms:isPartOf``, and nodes to the nodes they take inputs from with
@@ -125,7 +126,8 @@ which relates to each input and output through a ``prov:qualifiedUsage`` or
 ``prov:qualifiedGeneration`` that names the input or output (``nipype:inPort`` and
 ``nipype:outPort``).
 For example, the files read and written by every node that resampled a series may be
-listed with `rdflib <https://rdflib.readthedocs.io>`__:
+listed with `rdflib <https://rdflib.readthedocs.io>`__ (nodes are described in the default
+graph and interfaces in named graphs, hence querying their union):
 
 .. code-block:: python
 
@@ -172,7 +174,8 @@ Please note that:
     every tool that was run, the value of some environment variables (such as ``PATH``),
     and absolute paths as seen by the process (for instance, from within the container).
     The name of the user, the name of the host, and the standard output and error
-    of the tools are left out.
+    of the tools are left out, but paths may still reveal them (for instance, a home
+    directory).
     Review these files before sharing the derivatives.
 
 Visual Reports
