@@ -22,10 +22,15 @@
 #
 """Tests of provenance records."""
 
+import json
+import socket
+
 import pytest
-from nipype import config as ncfg
+import rdflib
 from nipype.interfaces import utility as niu
+from nipype.interfaces.base import CommandLine
 from nipype.pipeline import engine as pe
+from rdflib.compare import isomorphic
 
 from fmriprep.utils.provenance import (
     PROV_NAMESPACE,
@@ -34,13 +39,20 @@ from fmriprep.utils.provenance import (
     write_provenance,
 )
 
-PROV = 'http://www.w3.org/ns/prov#'
-NIPYPE = 'http://nipy.org/nipype/terms/'
-RDFS_LABEL = 'http://www.w3.org/2000/01/rdf-schema#label'
-CRYPTO = 'http://id.loc.gov/vocabulary/preservation/cryptographicHashFunctions/'
-DCTERMS = 'http://purl.org/dc/terms/'
+PROV = rdflib.Namespace('http://www.w3.org/ns/prov#')
+NIPYPE = rdflib.Namespace('http://nipy.org/nipype/terms/')
+DCTERMS = rdflib.Namespace('http://purl.org/dc/terms/')
+CRYPTO = rdflib.Namespace('http://id.loc.gov/vocabulary/preservation/cryptographicHashFunctions/')
+RDFS_LABEL = rdflib.RDFS.label
+RDF_TYPE = rdflib.RDF.type
+
 RUN_UUID = '20200306-105302_d365772b-fd60-4741-a722-372c2f558b50'
-RUN_ID = 'fmriprep-20200306T105302-d365'
+RUN_ID = 'fmriprep-20200306T105302-d365772b'
+MARKER = 'correct-horse-battery-staple'
+
+
+def _id(local=''):
+    return rdflib.URIRef(f'{PROV_NAMESPACE}{RUN_ID}{local}')
 
 
 def _add(a, b):
@@ -49,13 +61,6 @@ def _add(a, b):
     out_file = Path('sum.txt').absolute()
     out_file.write_text(f'{a + b}')
     return a + b, str(out_file)
-
-
-def _values(dataset, predicate):
-    """Collect the objects of a predicate across all the graphs of a dataset."""
-    from rdflib import URIRef
-
-    return {str(quad[2]) for quad in dataset.quads((None, URIRef(predicate), None))}
 
 
 def _init_wf(base_dir, log_dir, subjects):
@@ -75,7 +80,9 @@ def _init_wf(base_dir, log_dir, subjects):
             iterfield=['a'],
         )
         second.inputs.a = [3, 4]
+        echo = pe.Node(CommandLine('echo', args=MARKER), name='echo')
         sub_wf.connect(first, 'out', second, 'b')
+        sub_wf.add_nodes([echo])
         # Mimic fmriprep.workflows.base.init_fmriprep_wf
         sub_wf.config['execution']['crashdump_dir'] = str(log_dir / f'sub-{subject}' / 'log')
         for node in sub_wf._get_all_nodes():
@@ -86,13 +93,52 @@ def _init_wf(base_dir, log_dir, subjects):
 
 @pytest.fixture
 def execgraph(tmp_path, monkeypatch):
-    # Nipype drops provenance.{provn,ttl} files into the current directory
+    from nipype import config as ncfg
+
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setitem(ncfg._sections['execution'], 'write_provenance', 'true')
     monkeypatch.setitem(
         ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'out' / 'logs')
     )
-    return _init_wf(tmp_path / 'work', tmp_path / 'out', ['01', '02']).run(plugin='Linear')
+    wf = _init_wf(tmp_path / 'work', tmp_path / 'out', ['01', '02'])
+    # Processes started afresh, as fMRIPrep does, do not inherit Nipype's configuration
+    return wf.run(plugin='MultiProc', plugin_args={'n_procs': 2, 'mp_context': 'forkserver'})
+
+
+def _write(execgraph, tmp_path):
+    out_files, errors = write_provenance(
+        execgraph,
+        tmp_path / 'out' / 'logs',
+        RUN_UUID,
+        version='26.0.0+test',
+        command=['fmriprep', 'my bids', 'out', 'participant'],
+    )
+    assert errors == {}
+    return out_files
+
+
+def _load(out_file):
+    dataset = rdflib.Dataset()
+    dataset.parse(out_file, format='json-ld')
+    return dataset
+
+
+def _values(dataset, predicate):
+    """Collect the objects of a predicate across all the graphs of a dataset."""
+    return {str(quad[2]) for quad in dataset.quads((None, predicate, None))}
+
+
+@pytest.mark.parametrize(
+    ('run_uuid', 'expected'),
+    [
+        (RUN_UUID, RUN_ID),
+        ('20200306-105302_D365772B', RUN_ID),
+        ('custom', 'fmriprep-run-custom'),
+        ('my run #1', 'fmriprep-run-my%20run%20%231'),
+        ('', 'fmriprep-run-'),
+    ],
+)
+def test_get_run_id(run_uuid, expected):
+    assert get_run_id(run_uuid) == expected
 
 
 def test_group_nodes(tmp_path, execgraph):
@@ -103,6 +149,7 @@ def test_group_nodes(tmp_path, execgraph):
         subject = path.parent.name.removeprefix('sub-')
         assert sorted(node.fullname for node in nodes) == [
             'fmriprep_wf.shared',
+            f'fmriprep_wf.sub_{subject}_wf.echo',
             f'fmriprep_wf.sub_{subject}_wf.first',
             f'fmriprep_wf.sub_{subject}_wf.second',
         ]
@@ -111,120 +158,213 @@ def test_group_nodes(tmp_path, execgraph):
     assert list(group_nodes(execgraph.subgraph(groups[path][:1]), log_dir)) == [log_dir]
 
 
-@pytest.mark.parametrize(
-    ('run_uuid', 'expected'),
-    [
-        (RUN_UUID, RUN_ID),
-        ('20200306-105302_D365772B', RUN_ID),
-        ('custom', 'fmriprep-custom'),
-        ('my run #1', 'fmriprep-my-run-1'),
-    ],
-)
-def test_get_run_id(run_uuid, expected):
-    assert get_run_id(run_uuid) == expected
-    assert get_run_id(run_uuid, name='tool') == expected.replace('fmriprep', 'tool', 1)
-
-
 def test_write_provenance(tmp_path, execgraph):
-    rdflib = pytest.importorskip('rdflib')
-
-    out_files = write_provenance(
-        execgraph,
-        tmp_path / 'out' / 'logs',
-        RUN_UUID,
-        version='26.0.0',
-        command='fmriprep bids out participant',
-    )
+    out_files = _write(execgraph, tmp_path)
     assert sorted(out_files) == [
         tmp_path / 'out' / f'sub-{s}' / 'log' / 'provenance.jsonld' for s in ('01', '02')
     ]
+    # Nothing else is left behind
+    assert sorted(path.name for path in tmp_path.iterdir()) == ['out', 'work']
+    assert [path.name for path in (tmp_path / 'work').iterdir()] == ['fmriprep_wf']
+    assert [path.name for path in out_files[0].parent.iterdir()] == ['provenance.jsonld']
 
-    def _id(local=''):
-        return rdflib.URIRef(f'{PROV_NAMESPACE}{RUN_ID}{local}')
-
-    rdf_type = rdflib.RDF.type
-    label = rdflib.URIRef(RDFS_LABEL)
-    part_of = rdflib.URIRef(f'{DCTERMS}isPartOf')
-    informed_by = rdflib.URIRef(f'{PROV}wasInformedBy')
-    activity = rdflib.URIRef(f'{PROV}Activity')
     shared_graphs = []
     for out_file in out_files:
         subject = out_file.parent.parent.name.removeprefix('sub-')
         other = {'01': '02', '02': '01'}[subject]
 
-        graph = rdflib.Dataset()
-        graph.parse(out_file, format='json-ld')
-        default = graph.default_graph
+        dataset = _load(out_file)
+        default = dataset.default_graph
 
         # The run, the workflows and the nodes are activities with informative identifiers
         sub_wf = f'/fmriprep_wf.sub_{subject}_wf'
-        assert set(default.subjects(rdf_type, activity)) == {
-            _id(),
-            _id('/fmriprep_wf'),
-            _id('/fmriprep_wf.shared'),
-            _id(sub_wf),
-            _id(f'{sub_wf}.first'),
-            _id(f'{sub_wf}.second'),
+        nodes = {
+            _id('/fmriprep_wf.shared'): _id('/fmriprep_wf'),
+            _id(f'{sub_wf}.echo'): _id(sub_wf),
+            _id(f'{sub_wf}.first'): _id(sub_wf),
+            _id(f'{sub_wf}.second'): _id(sub_wf),
         }
+        workflows = {_id('/fmriprep_wf'): _id(), _id(sub_wf): _id('/fmriprep_wf')}
+        assert set(default.subjects(RDF_TYPE, PROV.Activity)) == {_id(), *workflows, *nodes}
+        assert set(default.subjects(RDF_TYPE, NIPYPE.Workflow)) == set(workflows)
+        assert set(default.subject_objects(DCTERMS.isPartOf)) == set((nodes | workflows).items())
 
         # The run
-        assert str(default.value(_id(), label)) == RUN_ID
-        assert str(default.value(_id(), rdflib.URIRef(f'{DCTERMS}identifier'))) == RUN_UUID
-        assert str(default.value(_id(), rdflib.URIRef(f'{NIPYPE}command'))).startswith('fmriprep ')
-        assert str(default.value(_id(), rdflib.URIRef(f'{PROV}startedAtTime'))).startswith(
-            '2020-03-06T10:53:02'
-        )
-        agent = default.value(_id(), rdflib.URIRef(f'{PROV}wasAssociatedWith'))
-        assert agent == rdflib.URIRef(f'{PROV_NAMESPACE}fmriprep-26.0.0')
-        assert str(default.value(agent, rdflib.URIRef(f'{NIPYPE}version'))) == '26.0.0'
+        assert str(default.value(_id(), RDFS_LABEL)) == RUN_ID
+        assert str(default.value(_id(), DCTERMS.identifier)) == RUN_UUID
+        assert str(default.value(_id(), NIPYPE.command)) == "fmriprep 'my bids' out participant"
+        started = default.value(_id(), PROV.startedAtTime).toPython()
+        ended = default.value(_id(), PROV.endedAtTime).toPython()
+        assert started.utcoffset() is not None
+        assert started < ended
+        agent = default.value(_id(), PROV.wasAssociatedWith)
+        assert agent == rdflib.URIRef(f'{PROV_NAMESPACE}fmriprep-26.0.0%2Btest')
+        assert (agent, RDF_TYPE, PROV.SoftwareAgent) in default
+        assert str(default.value(agent, NIPYPE.version)) == '26.0.0+test'
 
-        # The hierarchy of workflows
-        workflow = rdflib.URIRef(f'{NIPYPE}Workflow')
-        assert set(default.subjects(rdf_type, workflow)) == {_id('/fmriprep_wf'), _id(sub_wf)}
-        assert set(default.subject_objects(part_of)) == {
-            (_id('/fmriprep_wf'), _id()),
-            (_id('/fmriprep_wf.shared'), _id('/fmriprep_wf')),
-            (_id(sub_wf), _id('/fmriprep_wf')),
-            (_id(f'{sub_wf}.first'), _id(sub_wf)),
-            (_id(f'{sub_wf}.second'), _id(sub_wf)),
-        }
-        assert str(default.value(_id(f'{sub_wf}.second'), label)) == 'second'
-        assert (_id(f'{sub_wf}.second'), rdf_type, rdflib.URIRef(f'{NIPYPE}MapNode')) in default
-        assert (_id(f'{sub_wf}.first'), rdf_type, rdflib.URIRef(f'{NIPYPE}Function')) in default
-
-        # Dependencies between nodes
-        assert set(default.subject_objects(informed_by)) == {
+        # The nodes
+        assert str(default.value(_id(f'{sub_wf}.second'), RDFS_LABEL)) == 'second'
+        assert (_id(f'{sub_wf}.second'), RDF_TYPE, NIPYPE.MapNode) in default
+        assert (_id(f'{sub_wf}.first'), RDF_TYPE, NIPYPE.Node) in default
+        assert (_id(f'{sub_wf}.first'), RDF_TYPE, NIPYPE.Function) in default
+        assert str(default.value(_id(f'{sub_wf}.echo'), NIPYPE.command)) == f'echo {MARKER}'
+        for node in nodes:
+            assert default.value(node, NIPYPE.hashval)
+            assert (
+                started
+                < default.value(node, PROV.startedAtTime).toPython()
+                <= default.value(node, PROV.endedAtTime).toPython()
+                < ended
+            )
+        assert set(default.subject_objects(PROV.wasInformedBy)) == {
             (_id(f'{sub_wf}.first'), _id('/fmriprep_wf.shared')),
             (_id(f'{sub_wf}.second'), _id(f'{sub_wf}.first')),
         }
 
-        # One bundle per node execution: shared + first + two iterations of second
-        bundles = {
+        # One bundle per execution of an interface
+        records = {
             _id('/fmriprep_wf.shared/record'): _id('/fmriprep_wf.shared'),
+            _id(f'{sub_wf}.echo/record'): _id(f'{sub_wf}.echo'),
             _id(f'{sub_wf}.first/record'): _id(f'{sub_wf}.first'),
             _id(f'{sub_wf}.second/record-0'): _id(f'{sub_wf}.second'),
             _id(f'{sub_wf}.second/record-1'): _id(f'{sub_wf}.second'),
         }
-        assert set(default.subjects(rdf_type, rdflib.URIRef(f'{PROV}Bundle'))) == set(bundles)
-        assert set(bundles) == {g.identifier for g in graph.graphs()} - {default.identifier}
-        for bundle, node in bundles.items():
-            assert (bundle, rdflib.URIRef(f'{PROV}wasGeneratedBy'), node) in default
+        assert set(default.subjects(RDF_TYPE, PROV.Bundle)) == set(records)
+        assert set(records) == {g.identifier for g in dataset.graphs()} - {default.identifier}
+        for record, node in records.items():
+            assert (record, PROV.wasGeneratedBy, node) in default
+            # ... where the execution of the interface is linked to its node
+            interface = rdflib.URIRef(record.replace('/record', '/interface'))
+            graph = dataset.graph(record)
+            assert set(graph.subjects(RDF_TYPE, PROV.Activity)) == {interface}
+            assert (interface, DCTERMS.isPartOf, node) in graph
+            inputs = rdflib.URIRef(record.replace('/record', '/inputs'))
+            assert (inputs, RDF_TYPE, NIPYPE.Inputs) in graph
 
-        # The details of what was run are available, and do not leak across participants
-        workdirs = _values(graph, f'{NIPYPE}workingDirectory')
-        assert len(workdirs) == 4
-        assert sum(f'sub_{subject}_wf' in workdir for workdir in workdirs) == 3
+        # Inputs and outputs of an interface, by name
+        graph = dataset.graph(_id(f'{sub_wf}.second/record-1'))
+        ports = {}
+        for usage in graph.objects(_id(f'{sub_wf}.second/interface-1'), PROV.qualifiedUsage):
+            entity = graph.value(usage, PROV.entity)
+            ports[str(graph.value(usage, NIPYPE.inPort))] = graph.value(entity, PROV.value)
+        assert ports['a'].toPython() == 4
+        assert ports['b'].toPython() == 3
+        (location,) = graph.objects(None, PROV.atLocation)
+        assert str(location) == (
+            f'file://{tmp_path}/work/fmriprep_wf/sub_{subject}_wf/second/mapflow/_second1/sum.txt'
+        )
+
+        # The details of what was run do not leak across participants
+        workdirs = _values(dataset, NIPYPE.workingDirectory)
+        assert len(workdirs) == 5
+        assert sum(f'sub_{subject}_wf' in workdir for workdir in workdirs) == 4
         assert not any(f'sub_{other}_wf' in workdir for workdir in workdirs)
-        outputs = _values(graph, f'{PROV}atLocation')
-        assert len(outputs) == 4
-        assert all(output.endswith('sum.txt') for output in outputs)
-        # Checksums of 1, 3, 3 + 3, and 3 + 4
-        assert len(_values(graph, f'{CRYPTO}sha512')) == 4
+        # Checksums of the files that still exist: 3 + 3, and 3 + 4
+        # (Nipype removes the outputs that no other node needs)
+        assert len(_values(dataset, CRYPTO.sha512)) == 2
 
         shared_graphs.append(
-            {(s, p, o) for s, p, o in default if 'sub_' not in f'{s}{o}' and 'Time' not in str(p)}
+            (
+                {triple for triple in default if 'sub_' not in ''.join(map(str, triple))},
+                dataset.graph(_id('/fmriprep_wf.shared/record')),
+            )
         )
 
     # What is not specific to a participant is described identically in all files
-    assert shared_graphs[0] == shared_graphs[1]
-    assert (_id('/fmriprep_wf.shared'), rdf_type, activity) in shared_graphs[0]
+    (default_1, record_1), (default_2, record_2) = shared_graphs
+    assert default_1 == default_2
+    assert (_id('/fmriprep_wf.shared'), RDF_TYPE, PROV.Activity) in default_1
+    assert len(record_1) > 20
+    assert isomorphic(record_1, record_2)
+
+
+def test_jsonld_default_graph(tmp_path, execgraph):
+    """The default graph must not be wrapped into an anonymous named graph."""
+    out_file = _write(execgraph, tmp_path)[0]
+    jsonld = json.loads(out_file.read_text())
+    assert set(jsonld) == {'@context', '@graph'}
+    assert all('@id' in item for item in jsonld['@graph'])
+    named = [item for item in jsonld['@graph'] if '@graph' in item]
+    assert len(named) == 5
+    assert all(item['@id'].startswith(f'bidsprov:{RUN_ID}/') for item in named)
+
+
+def test_privacy(tmp_path, execgraph, monkeypatch):
+    """User, host and output streams are not recorded."""
+    import getpass
+
+    monkeypatch.setenv('LOGNAME', 'jane.doe')
+    assert getpass.getuser() == 'jane.doe'
+
+    for out_file in _write(execgraph, tmp_path):
+        text = out_file.read_text()
+        assert 'jane.doe' not in text
+        assert 'foaf:host' not in text
+        assert f'file://{socket.gethostname()}' not in text
+        assert 'file:///' in text
+        for stream in ('stdout', 'stderr', 'merged', 'LoggedInUser', 'prov:Person'):
+            assert stream not in text
+        # What the command printed is not recorded: the marker only shows as an input
+        # (``args``) and in the command line of the node and of the interface
+        assert text.count(MARKER) == 3
+        dataset = _load(out_file)
+        assert _values(dataset, NIPYPE.environmentVariable) >= {'PATH'}
+        assert not _values(dataset, NIPYPE.environmentVariable) & {'USER', 'LOGNAME'}
+        # No dangling references to what was left out
+        for graph in dataset.graphs():
+            subjects = set(graph.subjects())
+            for obj in graph.objects(None, PROV.agent):
+                assert obj in subjects
+
+
+def test_unknown_user(tmp_path, execgraph, monkeypatch):
+    """Users without a name (e.g., ``docker run -u <uid>``) get their provenance too."""
+    import getpass
+    import os
+    import pwd
+
+    for envvar in ('LOGNAME', 'USER', 'LNAME', 'USERNAME'):
+        monkeypatch.delenv(envvar, raising=False)
+
+    def _getpwuid(uid):
+        raise KeyError(f'getpwuid(): uid not found: {uid}')
+
+    monkeypatch.setattr(pwd, 'getpwuid', _getpwuid)
+    with pytest.raises(OSError, match='No username'):
+        getpass.getuser()
+
+    assert len(_write(execgraph, tmp_path)) == 2
+    assert 'LOGNAME' not in os.environ
+
+
+def test_checksums_once(tmp_path, execgraph, monkeypatch):
+    """Files are read once, however many nodes they are involved in."""
+    from nipype.utils import provenance as nprov
+
+    calls = []
+    hash_infile = nprov.hash_infile
+
+    def _hash_infile(afile, *args, **kwargs):
+        calls.append(afile)
+        return hash_infile(afile, *args, **kwargs)
+
+    monkeypatch.setattr(nprov, 'hash_infile', _hash_infile)
+    _write(execgraph, tmp_path)
+    # The two outputs of ``second``, which are used and generated, for each participant
+    assert len(calls) == len(set(calls)) == 4
+    assert nprov.hash_infile is _hash_infile
+
+
+def test_write_provenance_errors(tmp_path, execgraph, monkeypatch):
+    """A participant whose records cannot be written does not affect the others."""
+    from pathlib import Path
+
+    bad_node = next(n for n in execgraph.nodes() if n.fullname == 'fmriprep_wf.sub_01_wf.first')
+    for path in Path(bad_node.output_dir()).glob('result_*.pklz'):
+        path.unlink()
+
+    out_files, errors = write_provenance(execgraph, tmp_path / 'out' / 'logs', RUN_UUID)
+    assert out_files == [tmp_path / 'out' / 'sub-02' / 'log' / 'provenance.jsonld']
+    assert list(errors) == [tmp_path / 'out' / 'sub-01' / 'log']
+    # No partial file is left behind
+    assert list((tmp_path / 'out').rglob('*provenance*')) == out_files

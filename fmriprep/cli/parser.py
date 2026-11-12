@@ -757,9 +757,9 @@ https://fmriprep.readthedocs.io/en/{currentv.base_version if is_release else 'la
         '--write-provenance',
         action='store_true',
         default=False,
-        help='Record the provenance (W3C PROV) of all the processing steps executed by Nipype, '
-        'and write it as JSON-LD (provenance.jsonld) into the log directory of each '
-        'participant (and session, when processing sessions separately).',
+        help='Write a description (W3C PROV, as JSON-LD) of all the processing steps that were '
+        'executed, with their inputs and outputs, into the log directory of each participant. '
+        'Absolute paths and command lines are recorded: review before sharing.',
     )
     g_other.add_argument(
         '--config-file',

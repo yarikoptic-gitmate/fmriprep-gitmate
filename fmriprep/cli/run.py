@@ -166,25 +166,31 @@ def main():
             sentry_sdk.add_breadcrumb(message=success_message, level='info')
             sentry_sdk.capture_message(success_message, level='info')
 
-        if config.nipype.write_provenance:
+        if config.execution.write_provenance:
             from ..utils.provenance import write_provenance
 
+            config.loggers.workflow.log(25, 'Writing provenance records ...')
             try:
-                prov_files = write_provenance(
+                prov_files, prov_errors = write_provenance(
                     execgraph,
                     config.execution.log_dir,
                     config.execution.run_uuid,
                     version=config.environment.version,
-                    command=' '.join(sys.argv),
+                    command=sys.argv,
                 )
             except Exception as e:  # noqa: BLE001 - provenance must not fail the run
-                config.loggers.workflow.warning(f'Could not write provenance: {e}')
+                config.loggers.workflow.warning(f'Could not write provenance records: {e}')
             else:
-                config.loggers.workflow.log(
-                    25,
-                    'Provenance records written to:\n'
-                    + '\n'.join(f'\t\t{fname}' for fname in prov_files),
-                )
+                for log_dir, error in prov_errors.items():
+                    config.loggers.workflow.warning(
+                        f'Could not write provenance records to {log_dir}: {error}'
+                    )
+                if prov_files:
+                    config.loggers.workflow.log(
+                        25,
+                        'Provenance records written to:\n'
+                        + '\n'.join(f'\t\t{fname}' for fname in prov_files),
+                    )
 
         # Bother users with the boilerplate only iff the workflow went okay.
         boiler_file = config.execution.fmriprep_dir / 'logs' / 'CITATION.md'

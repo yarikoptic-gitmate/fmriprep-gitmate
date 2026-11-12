@@ -28,6 +28,7 @@ processing_groups = [ "sub-01",]
 templateflow_home = "~/.cache/templateflow"
 work_dir = "work/"
 write_graph = false
+write_provenance = false
 
 [workflow]
 anat_only = false
@@ -58,7 +59,6 @@ omp_nthreads = 8
 plugin = "MultiProc"
 resource_monitor = false
 stop_on_first_crash = false
-write_provenance = false
 
 [nipype.plugin_args]
 maxtasksperchild = 1

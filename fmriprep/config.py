@@ -332,8 +332,6 @@ class nipype(_Config):
     """Enable resource monitor."""
     stop_on_first_crash = True
     """Whether the workflow should stop or continue after the first error."""
-    write_provenance = False
-    """Record `W3C PROV <https://www.w3.org/TR/prov-overview/>`__ provenance of the execution."""
 
     @classmethod
     def get_plugin(cls):
@@ -365,13 +363,6 @@ class nipype(_Config):
                 }
             )
             ncfg.enable_resource_monitor()
-
-        # Have every interface record its provenance (inputs, outputs, command line...)
-        if cls.write_provenance:
-            # Not using ``ncfg.enable_provenance()``, which also switches the
-            # ``hash_method`` to ``content``: that would invalidate the caches of
-            # existing working directories and checksum all inputs of every node.
-            ncfg.set('execution', 'write_provenance', 'true')
 
         # Nipype config (logs and execution)
         ncfg.update_config(
@@ -463,6 +454,8 @@ class execution(_Config):
     """Path to a working directory where intermediate results will be available."""
     write_graph = False
     """Write out the computational graph corresponding to the planned preprocessing."""
+    write_provenance = False
+    """Write `W3C PROV <https://www.w3.org/TR/prov-overview/>`__ records of the execution."""
     dataset_links = {}
     """A dictionary of dataset links to be used to track Sources in sidecars."""
 
