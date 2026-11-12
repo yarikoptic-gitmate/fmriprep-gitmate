@@ -60,6 +60,12 @@ Values (including files, by their checksum) keep the content-based identifiers
 Derivatives are often shared, so the records are stripped of the name of the user,
 the name of the host, the ``USER`` and ``LOGNAME`` environment variables, and
 the standard output and error of the interfaces.
+
+**Reproducibility**.
+Besides the environment variables *Nipype* records (such as ``PATH`` or
+``OMP_NUM_THREADS``), those that seed random number generators or restrict the
+CPU features in use are recorded for each interface
+(see :data:`REPRODUCIBILITY_ENVVARS`).
 """
 
 import getpass
@@ -95,6 +101,33 @@ JSONLD_CONTEXT = {
 _RUN_UUID = re.compile(r'(?P<date>\d{8})-(?P<time>\d{6})_(?P<uid>[0-9a-fA-F]{8})')
 _FILE_HOST = re.compile(r'file://[^/\s"\']+/')
 _PRIVATE_ENVVARS = ('USER', 'LOGNAME')
+REPRODUCIBILITY_ENVVARS = (
+    # Seeds of random number generators
+    'ANTS_RANDOM_SEED',
+    'AFNI_RANDOM_SEEDVAL',
+    'FREESURFER_SEED',
+    'GSL_RNG_SEED',
+    'GSL_RNG_TYPE',
+    'MVPA_SEED',
+    'PYTHONHASHSEED',
+    'REPROSEED',
+    # CPU features numerical libraries are restricted to
+    'REPROSEED_CPU',
+    'NPY_DISABLE_CPU_FEATURES',
+    'NPY_ENABLE_CPU_FEATURES',
+    'OPENBLAS_CORETYPE',
+    'MKL_CBWR',
+    'ATEN_CPU_CAPABILITY',
+    'ONEDNN_MAX_CPU_ISA',
+    'DNNL_MAX_CPU_ISA',
+    # Multithreading
+    'ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+)
+"""Environment variables recorded in addition to those *Nipype* records, as they
+determine whether results can be replicated (see, for instance,
+`reproseed <https://github.com/ReproNim/reproseed>`__)."""
 _OUTPUT_STREAMS = ('stdout', 'stderr', 'merged')
 
 
@@ -199,22 +232,22 @@ def _known_user():
 
 
 @contextmanager
-def _memoized_checksums():
-    """Have *Nipype* calculate the checksum of each file only once.
+def _nipype_patches():
+    """Adjust how *Nipype* describes results, for which it offers no options.
 
-    The same files (for instance, a BOLD series) are inputs or outputs of many nodes,
-    and *Nipype* would read them in full every time one is described.
+    * The checksum of each file is calculated only once. The same files (for instance,
+      a BOLD series) are inputs or outputs of many nodes, and *Nipype* would read
+      them in full every time one is described.
+    * The :data:`REPRODUCIBILITY_ENVVARS` are recorded too.
+
+    Should *Nipype* rename what is patched here, records are just built without these.
     """
+    from contextlib import ExitStack
     from unittest import mock
 
     from nipype.utils import provenance as nprov
 
-    # Nipype offers no way to cache checksums, hence replacing the function it looks up.
-    # Without it (e.g., renamed in a future release), checksums are just not memoized.
     hash_infile = getattr(nprov, 'hash_infile', None)
-    if hash_infile is None:
-        yield
-        return
     cache = {}
 
     def _hash_infile(afile, *args, **kwargs):
@@ -227,7 +260,13 @@ def _memoized_checksums():
             cache[key] = hash_infile(afile, *args, **kwargs)
         return cache[key]
 
-    with mock.patch.object(nprov, 'hash_infile', _hash_infile):
+    with ExitStack() as stack:
+        if hash_infile is not None:
+            stack.enter_context(mock.patch.object(nprov, 'hash_infile', _hash_infile))
+        if (envvars := getattr(nprov, 'PROV_ENVVARS', None)) is not None:
+            stack.enter_context(
+                mock.patch.object(nprov, 'PROV_ENVVARS', [*envvars, *REPRODUCIBILITY_ENVVARS])
+            )
         yield
 
 
@@ -294,6 +333,8 @@ def _add_record(doc, records, node_id, suffix=''):
     def _value(value):
         if isinstance(value, pm.QualifiedName):
             return renamed.get(value, value)
+        if isinstance(value, pm.Identifier):  # How prov < 3.3 holds xsd:anyURI values
+            return pm.Identifier(_FILE_HOST.sub('file:///', value.uri))
         # file://<hostname>/path -> file:///path, also within lists and dictionaries
         # of files, which Nipype records as text
         if isinstance(value, pm.Literal) and isinstance(value.value, str):
@@ -505,7 +546,7 @@ def write_provenance(execgraph, default_dir, run_uuid, *, version=None, command=
     ended = datetime.now(UTC)
     out_files = []
     errors = {}
-    with _memoized_checksums():
+    with _nipype_patches():
         for log_dir, nodes in group_nodes(execgraph, default_dir).items():
             out_file = log_dir / PROV_FILENAME
             tmp_file = out_file.with_name(f'.{PROV_FILENAME}.tmp')

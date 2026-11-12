@@ -166,6 +166,10 @@ Please note that:
 * Inputs and outputs that are lists (for instance, the chain of transforms to apply) are
   recorded as text, without checksums. The nodes that generated those files can be
   found following ``prov:wasInformedBy``.
+* Environment variables that seed random number generators or restrict the CPU features
+  used by numerical libraries (for instance, those set by
+  `reproseed <https://github.com/ReproNim/reproseed>`__) are recorded for each interface,
+  as is the ``--random-seed`` in the command line of the run.
 * Nodes that were not run again because their results were cached in the working
   directory are described too, with their original timing.
 

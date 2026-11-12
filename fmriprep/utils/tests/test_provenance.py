@@ -84,7 +84,9 @@ def _init_wf(base_dir, log_dir, subjects):
             iterfield=['a'],
         )
         second.inputs.a = [3, 4]
-        echo = pe.Node(CommandLine('echo', args=MARKER), name='echo')
+        echo = pe.Node(
+            CommandLine('echo', args=MARKER, environ={'ANTS_RANDOM_SEED': '42'}), name='echo'
+        )
         # A dictionary of files, which Nipype records as text
         describe = pe.Node(niu.Function(function=_describe), name='describe')
         describe.inputs.files = {'self': __file__}
@@ -346,6 +348,19 @@ def test_privacy(tmp_path, execgraph, monkeypatch):
             subjects = set(graph.subjects())
             for obj in graph.objects(None, PROV.agent):
                 assert obj in subjects
+
+
+def test_reproducibility_envvars(tmp_path, execgraph):
+    """Seeds are recorded with the interfaces they were set for."""
+    dataset = _load(_write(execgraph, tmp_path)[0])
+    seeds = {
+        (graph.identifier, str(graph.value(entity, PROV.value)))
+        for graph in dataset.graphs()
+        for entity in graph.subjects(
+            NIPYPE.environmentVariable, rdflib.Literal('ANTS_RANDOM_SEED')
+        )
+    }
+    assert seeds == {(_id('/fmriprep_wf.sub_01_wf.echo/record'), '42')}
 
 
 def test_unknown_user(tmp_path, execgraph, monkeypatch):
