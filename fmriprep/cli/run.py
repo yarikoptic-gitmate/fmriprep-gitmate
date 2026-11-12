@@ -170,7 +170,13 @@ def main():
             from ..utils.provenance import write_provenance
 
             try:
-                prov_files = write_provenance(execgraph, config.execution.log_dir)
+                prov_files = write_provenance(
+                    execgraph,
+                    config.execution.log_dir,
+                    config.execution.run_uuid,
+                    version=config.environment.version,
+                    command=' '.join(sys.argv),
+                )
             except Exception as e:  # noqa: BLE001 - provenance must not fail the run
                 config.loggers.workflow.warning(f'Could not write provenance: {e}')
             else:
