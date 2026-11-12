@@ -357,7 +357,55 @@ def _add_record(doc, records, node_id, suffix=''):
         bundle.new_record(
             record.get_type(), renamed.get(record.identifier, record.identifier), attributes
         )
+        if record.get_type() == pm.PROV_ENTITY:
+            _add_members(bundle, record, _value)
     return bundle
+
+
+def _listed_files(value):
+    """Find the files within a list that *Nipype* recorded as text."""
+    if not isinstance(value, str) or not value.lstrip().startswith('['):
+        return []
+    try:
+        items = json.loads(value)
+    except ValueError:
+        return []
+
+    def _flatten(item):
+        if isinstance(item, list):
+            for subitem in item:
+                yield from _flatten(subitem)
+        elif isinstance(item, str) and os.path.isfile(item):
+            yield item
+
+    return list(_flatten(items))
+
+
+def _add_members(bundle, record, _value):
+    """Describe the files of a list (e.g., a chain of transforms) as its members.
+
+    *Nipype* records lists of several files as text, hence without their checksums.
+    """
+    import prov.model as pm
+    from nipype.utils.provenance import prov_encode
+
+    files = [
+        afile
+        for key, val in record.attributes
+        if key == pm.PROV_VALUE
+        for afile in _listed_files(val)
+    ]
+    if not files:
+        return
+    bundle.collection(record.identifier)
+    for afile in files:
+        member = prov_encode(pm.ProvDocument(), afile)
+        bundle.new_record(
+            member.get_type(),
+            member.identifier,
+            [(key, _value(val)) for key, val in member.attributes],
+        )
+        bundle.hadMember(record.identifier, member.identifier)
 
 
 def build_provenance(execgraph, run_uuid, *, version=None, command=None, ended=None):

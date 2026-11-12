@@ -163,9 +163,9 @@ Please note that:
 * Files are identified by their checksum, so files with identical contents are one
   entity with several locations.
   ``prov:wasInformedBy`` is the authoritative description of the dependencies between nodes.
-* Inputs and outputs that are lists (for instance, the chain of transforms to apply) are
-  recorded as text, without checksums. The nodes that generated those files can be
-  found following ``prov:wasInformedBy``.
+* Inputs and outputs that are lists of files (for instance, the chain of transforms to
+  apply) are recorded as text, and each of the files as a member (``prov:hadMember``) of
+  that list, with its checksum.
 * Environment variables that seed random number generators or restrict the CPU features
   used by numerical libraries (for instance, those set by
   `reproseed <https://github.com/ReproNim/reproseed>`__) are recorded for each interface,

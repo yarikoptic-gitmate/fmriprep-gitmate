@@ -150,6 +150,15 @@ def _load(out_file):
     return dataset
 
 
+def _named(graph):
+    """The collections of inputs, outputs and environment of an interface."""
+    return {
+        subject
+        for kind in (NIPYPE.Inputs, NIPYPE.Outputs, NIPYPE.Environment)
+        for subject in graph.subjects(RDF_TYPE, kind)
+    }
+
+
 def _values(dataset, predicate):
     """Collect the objects of a predicate across all the graphs of a dataset."""
     return {str(quad[2]) for quad in dataset.quads((None, predicate, None))}
@@ -360,7 +369,11 @@ def test_reproducibility_envvars(tmp_path, execgraph):
             NIPYPE.environmentVariable, rdflib.Literal('ANTS_RANDOM_SEED')
         )
     }
-    assert seeds == {(_id('/fmriprep_wf.sub_01_wf.echo/record'), '42')}
+    # Other interfaces may have got one from the environment the tests are run in
+    assert (_id('/fmriprep_wf.sub_01_wf.echo/record'), '42') in seeds
+    assert not {record for record, seed in seeds if seed == '42'} - {
+        _id('/fmriprep_wf.sub_01_wf.echo/record')
+    }
 
 
 def test_unknown_user(tmp_path, execgraph, monkeypatch):
@@ -442,3 +455,83 @@ def test_node_without_result(tmp_path, execgraph, monkeypatch, caplog):
     assert (_id('/fmriprep_wf.sub_01_wf.second'), PROV.wasInformedBy, node) in default
     assert not list(default.subjects(PROV.wasGeneratedBy, node))
     assert len(list(default.subjects(RDF_TYPE, PROV.Bundle))) == 5
+
+
+def test_redo_resampling(tmp_path_factory, monkeypatch, capsys):
+    """Resamplings can be redone with nipost alone, from their provenance records."""
+    import importlib.util
+    from pathlib import Path
+
+    import nibabel as nb
+    import nitransforms as nt
+    import numpy as np
+
+    from fmriprep.interfaces.resampling import ResampleSeries
+
+    script = Path(__file__).parents[3] / 'scripts' / 'prov2nipost.py'
+    if not script.exists():
+        pytest.skip('scripts/prov2nipost.py is only available in the source tree')
+    spec = importlib.util.spec_from_file_location('prov2nipost', script)
+    prov2nipost = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prov2nipost)
+
+    from nipype import config as ncfg
+
+    tmp_path = tmp_path_factory.mktemp('redo')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'logs'))
+    rng = np.random.default_rng(2026)
+    nb.Nifti1Image(rng.random((8, 8, 8, 3), dtype='f4'), np.eye(4)).to_filename('bold.nii.gz')
+    nb.Nifti1Image(np.zeros((6, 6, 6), dtype='f4'), np.eye(4)).to_filename('ref.nii.gz')
+    xfms = []
+    for idx, shift in enumerate((0.5, -1.0)):
+        matrix = np.eye(4)
+        matrix[idx, 3] = shift
+        xfms.append(str(tmp_path / f'xfm{idx}.txt'))
+        nt.linear.Affine(matrix).to_filename(xfms[-1], fmt='itk')
+
+    wf = pe.Workflow(name='fmriprep_wf', base_dir=str(tmp_path / 'work'))
+    resample = pe.Node(
+        ResampleSeries(
+            in_file=str(tmp_path / 'bold.nii.gz'),
+            ref_file=str(tmp_path / 'ref.nii.gz'),
+            transforms=xfms,
+            inverse=[False, True],
+        ),
+        name='resample',
+    )
+    wf.add_nodes([resample])
+    execgraph = wf.run(plugin='Linear')
+    (out_file,), errors = write_provenance(execgraph, tmp_path / 'logs', RUN_UUID)
+    assert errors == {}
+    assert out_file == tmp_path / 'logs' / 'provenance.jsonld'
+
+    # The transforms are a list, whose files are described with their checksums
+    dataset = _load(out_file)
+    graph = dataset.graph(_id('/fmriprep_wf.resample/record'))
+    (chain,) = set(graph.subjects(RDF_TYPE, PROV.Collection)) - _named(graph)
+    assert json.loads(graph.value(chain, PROV.value)) == xfms
+    members = set(graph.objects(chain, PROV.hadMember))
+    assert {str(graph.value(member, PROV.atLocation)) for member in members} == {
+        f'file://{xfm}' for xfm in xfms
+    }
+    assert all(graph.value(member, CRYPTO.sha512) for member in members)
+
+    # Where it was run
+    assert prov2nipost.main([str(out_file), '--out-dir', str(tmp_path / 'redo')]) == 0
+    assert 'checksum identical to the original' in capsys.readouterr().out
+
+    # Elsewhere (e.g., outside of the container), translating paths
+    (tmp_path / 'moved').mkdir()
+    for path in ('bold.nii.gz', 'ref.nii.gz', 'xfm0.txt', 'xfm1.txt', 'work'):
+        (tmp_path / path).rename(tmp_path / 'moved' / path)
+    args = [str(out_file), '--out-dir', str(tmp_path / 'redo2')]
+    assert prov2nipost.main(args) == 1
+    assert 'does not exist' in capsys.readouterr().out
+    assert prov2nipost.main([*args, '--map', f'{tmp_path}={tmp_path}/moved']) == 0
+    assert 'checksum identical to the original' in capsys.readouterr().out
+
+    # Inputs that changed are detected
+    (tmp_path / 'moved' / 'xfm1.txt').write_text((tmp_path / 'moved' / 'xfm0.txt').read_text())
+    assert prov2nipost.main([*args, '--map', f'{tmp_path}={tmp_path}/moved']) == 1
+    assert 'differs from what was recorded' in capsys.readouterr().out
