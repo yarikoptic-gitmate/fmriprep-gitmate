@@ -44,10 +44,8 @@ for the description of each interface, split the description by participant
     * a failure to write them (e.g., when the user is unknown to the system, as is common
       in containers) makes a successful run of *fMRIPrep* fail.
 
-    Two limitations of how *Nipype* encodes values remain, and result in warnings:
-    dictionaries and lists holding objects such as :class:`pathlib.Path` are replaced by an
-    error message, and nodes with sequences of *NumPy* scalars among their inputs or
-    outputs are left without their detailed record.
+    Its description of each interface is reused, working around how it encodes some
+    values (see :func:`_nipype_patches`).
 
 **Identifiers**.
 The run, and the workflows and nodes executed in it, are given identifiers
@@ -93,6 +91,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
+import numpy as np
 import prov.model as pm
 from nipype.interfaces.base import isdefined
 from nipype.interfaces.base.support import InterfaceResult
@@ -258,6 +257,9 @@ def _nipype_patches():
       a BOLD series) are inputs or outputs of many nodes, and *Nipype* would read
       them in full every time one is described.
     * The :data:`REPRODUCIBILITY_ENVVARS` are recorded too.
+    * Values *Nipype* does not encode well are converted first: booleans would be recorded
+      as integers, a dictionary or list holding path objects as an error message,
+      and a sequence of *NumPy* scalars would fail the description of the node.
 
     Should *Nipype* rename what is patched here, records are just built without these.
     """
@@ -275,7 +277,28 @@ def _nipype_patches():
             cache[key] = hash_infile(afile, *args, **kwargs)
         return cache[key]
 
+    safe_encode = getattr(nprov, 'safe_encode', None)
+
+    def _plain(x):
+        if isinstance(x, np.generic | np.ndarray):
+            return x.tolist()
+        if isinstance(x, os.PathLike):
+            return os.fspath(x)
+        if isinstance(x, list | tuple):
+            return type(x)(_plain(item) for item in x)
+        if isinstance(x, dict):
+            return {key: _plain(value) for key, value in x.items()}
+        return x
+
+    def _safe_encode(x, as_literal=True):
+        x = _plain(x)
+        if isinstance(x, bool):
+            return pm.Literal(x, pm.XSD['boolean']) if as_literal else x
+        return safe_encode(x, as_literal=as_literal)
+
     with ExitStack() as stack:
+        if safe_encode is not None:
+            stack.enter_context(mock.patch.object(nprov, 'safe_encode', _safe_encode))
         if hash_infile is not None:
             stack.enter_context(mock.patch.object(nprov, 'hash_infile', _hash_infile))
         if (envvars := getattr(nprov, 'PROV_ENVVARS', None)) is not None:

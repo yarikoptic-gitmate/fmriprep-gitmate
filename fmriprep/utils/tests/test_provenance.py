@@ -620,3 +620,51 @@ def test_redo_target(tmp_path_factory, monkeypatch, capsys, prov2nipost):
     bold.unlink()
     assert prov2nipost.main(args) == 1
     assert 'PROBLEM' in capsys.readouterr().out
+
+
+def _mixed_values(flag, links):
+    import numpy as np
+
+    return not flag, (np.float32(1.5), np.float32(2.0)), links
+
+
+def test_encoding(tmp_path, monkeypatch, caplog):
+    """Booleans, path objects and NumPy scalars are recorded as what they are."""
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(ncfg._sections['execution'], 'crashdump_dir', str(tmp_path / 'logs'))
+    wf = pe.Workflow(name='fmriprep_wf', base_dir=str(tmp_path / 'work'))
+    values = pe.Node(
+        niu.Function(
+            function=_mixed_values,
+            input_names=['flag', 'links'],
+            output_names=['flag', 'zooms', 'links'],
+        ),
+        name='values',
+    )
+    values.inputs.flag = True
+    values.inputs.links = {'raw': Path('/data'), 'known': [Path('/out'), 1]}
+    wf.add_nodes([values])
+    execgraph = wf.run(plugin='Linear')
+    (out_file,), errors = write_provenance(execgraph, tmp_path / 'logs', RUN_UUID)
+    assert errors == {}
+    assert 'Could not encode' not in caplog.text
+    assert 'No provenance record' not in caplog.text
+
+    graph = _load(out_file).graph(_id('/fmriprep_wf.values/record'))
+    recorded = {'in': {}, 'out': {}}
+    for usage in graph.subjects(NIPYPE.inPort, None):
+        port = str(graph.value(usage, NIPYPE.inPort))
+        recorded['in'][port] = graph.value(graph.value(usage, PROV.entity), PROV.value)
+    for generation in graph.subjects(NIPYPE.outPort, None):
+        port = str(graph.value(generation, NIPYPE.outPort))
+        (entity,) = graph.subjects(PROV.qualifiedGeneration, generation)
+        recorded['out'][port] = graph.value(entity, PROV.value)
+
+    assert recorded['in']['flag'].toPython() is True
+    assert recorded['out']['flag'].toPython() is False
+    assert recorded['in']['flag'].datatype == rdflib.XSD.boolean
+    links = json.loads(recorded['in']['links'])
+    assert links['raw'] == '/data'
+    assert json.loads(links['known']) == ['/out', 1]  # Nipype nests JSON within JSON
+    assert json.loads(recorded['out']['zooms']) == [1.5, 2.0]
