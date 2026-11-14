@@ -44,6 +44,7 @@ for the description of each interface, split the description by participant
     * a failure to write them (e.g., when the user is unknown to the system, as is common
       in containers) makes a successful run of *fMRIPrep* fail.
 
+    These are reported as `nipy/nipype#3818 <https://github.com/nipy/nipype/issues/3818>`__.
     Its description of each interface is reused, working around how it encodes some
     values (see :func:`_nipype_patches`).
 
@@ -258,8 +259,11 @@ def _nipype_patches():
       them in full every time one is described.
     * The :data:`REPRODUCIBILITY_ENVVARS` are recorded too.
     * Values *Nipype* does not encode well are converted first: booleans would be recorded
-      as integers, a dictionary or list holding path objects as an error message,
-      and a sequence of *NumPy* scalars would fail the description of the node.
+      as integers (`nipy/nipype#3817 <https://github.com/nipy/nipype/issues/3817>`__),
+      a dictionary or list holding path objects as an error message
+      (`nipy/nipype#3815 <https://github.com/nipy/nipype/issues/3815>`__),
+      and a sequence of *NumPy* scalars would fail the description of the node
+      (`nipy/nipype#3816 <https://github.com/nipy/nipype/issues/3816>`__).
 
     Should *Nipype* rename what is patched here, records are just built without these.
     """
